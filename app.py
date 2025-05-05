@@ -2,12 +2,24 @@ import gradio as gr
 import numpy as np
 import tensorflow as tf
 import psycopg2
+import os
+import gdown
 from datetime import datetime
 from PIL import Image
 from tensorflow.keras.models import load_model
 from tensorflow.keras import layers, models
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+
+# ---- Download model from Google Drive if not already present ----
+
+model_path = "model/brain_tumor_model_with_gradcam.h5"
+gdrive_url = "https://drive.google.com/uc?id=19JgIusns4ZBoJQAHDUYUXj2Ujfh0bBuM"
+
+if not os.path.exists(model_path):
+    os.makedirs("model", exist_ok=True)
+    print("Downloading model from Google Drive...")
+    gdown.download(gdrive_url, model_path, quiet=False)
 
 # ---- Custom Layers ----
 
@@ -59,7 +71,7 @@ class CBAMBlock(layers.Layer):
 
 # ---- Load model ----
 
-model = load_model("model/brain_tumor_model_with_gradcam.h5", custom_objects={
+model = load_model(model_path, custom_objects={
     'CBAMBlock': CBAMBlock,
     'TinyTransformerBlock': TinyTransformerBlock
 })
@@ -125,20 +137,15 @@ def predict(image):
     image_resized = image.resize((224, 224))
     img_array = np.expand_dims(np.array(image_resized) / 255.0, axis=0)
 
-    # predict using input layer name if it exists
     predictions = model.predict({"input_layer": img_array})[0]
     pred_index = np.argmax(predictions)
     pred_class = class_names[pred_index]
     confidence = float(predictions[pred_index]) * 100
 
-    # Grad-CAM heatmap
     heatmap = make_gradcam_heatmap(img_array, model, last_conv_layer_name)
     gradcam_img = overlay_gradcam(image_resized, heatmap)
 
-    # Get image name or use fallback
     image_name = getattr(image, "filename", "Unknown Image")
-
-    # Log to DB
     insert_prediction(image_name, pred_class, round(confidence, 2))
 
     if pred_class == "No Tumor":

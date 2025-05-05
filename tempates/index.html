@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Brain Tumor Detection</title>
+</head>
+<body>
+    <h1>Brain Tumor Classification</h1>
+    <form method="POST" enctype="multipart/form-data">
+        <input type="file" name="image" required><br><br>
+        <input type="submit" value="Predict">
+    </form>
+    {% if result %}
+    <h2>{{ result }}</h2>
+    {% endif %}
+</body>
+</html>
