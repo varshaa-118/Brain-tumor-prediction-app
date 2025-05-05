@@ -1,126 +1,107 @@
+import gradio as gr
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing import image
-import cv2
-from tensorflow.keras.layers import Layer, Dense, GlobalAveragePooling2D, GlobalMaxPooling2D, Reshape, Multiply, Conv2D, Activation, Add, Concatenate, LayerNormalization, MultiHeadAttention
-from tensorflow.keras import backend as K
-from flask import Flask, request, jsonify
-import os
+import psycopg2
+from datetime import datetime
 from PIL import Image
-import io
+from tensorflow.keras.models import load_model
+from tensorflow.keras import layers, models
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 
-# ------------------------------
-# CBAM Block
-# ------------------------------
-@tf.keras.utils.register_keras_serializable()
-class CBAMBlock(Layer):
-    def __init__(self, filters, reduction_ratio=16, **kwargs):
-        super(CBAMBlock, self).__init__(**kwargs)
-        self.filters = filters
-        self.reduction_ratio = reduction_ratio
+# ---- Custom Layers ----
 
-    def build(self, input_shape):
-        self.shared_dense_one = Dense(self.filters // self.reduction_ratio,
-                                      activation='relu',
-                                      kernel_initializer='he_normal',
-                                      use_bias=True)
-        self.shared_dense_two = Dense(self.filters,
-                                      kernel_initializer='he_normal',
-                                      use_bias=True)
-        self.conv_spatial = Conv2D(filters=1,
-                                   kernel_size=7,
-                                   strides=1,
-                                   padding='same',
-                                   activation='sigmoid',
-                                   kernel_initializer='he_normal',
-                                   use_bias=False)
-
-    def call(self, input_tensor):
-        avg_pool = GlobalAveragePooling2D()(input_tensor)
-        max_pool = GlobalMaxPooling2D()(input_tensor)
-
-        avg_pool = self.shared_dense_one(avg_pool)
-        avg_pool = self.shared_dense_two(avg_pool)
-
-        max_pool = self.shared_dense_one(max_pool)
-        max_pool = self.shared_dense_two(max_pool)
-
-        cbam_channel = Add()([avg_pool, max_pool])
-        cbam_channel = Activation('sigmoid')(cbam_channel)
-        cbam_channel = Reshape((1, 1, self.filters))(cbam_channel)
-        channel_refined = Multiply()([input_tensor, cbam_channel])
-
-        avg_pool_spatial = K.mean(channel_refined, axis=-1, keepdims=True)
-        max_pool_spatial = K.max(channel_refined, axis=-1, keepdims=True)
-        concat = Concatenate(axis=-1)([avg_pool_spatial, max_pool_spatial])
-        cbam_spatial = self.conv_spatial(concat)
-
-        refined_feature = Multiply()([channel_refined, cbam_spatial])
-        return refined_feature
-
-    def get_config(self):
-        config = super(CBAMBlock, self).get_config()
-        config.update({
-            "filters": self.filters,
-            "reduction_ratio": self.reduction_ratio
-        })
-        return config
-
-# ------------------------------
-# Tiny Transformer Block
-# ------------------------------
-@tf.keras.utils.register_keras_serializable()
-class TinyTransformerBlock(Layer):
-    def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1, **kwargs):
-        super(TinyTransformerBlock, self).__init__(**kwargs)
-        self.att = MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
-        self.ffn = tf.keras.Sequential([
-            Dense(ff_dim, activation='relu'),
-            Dense(embed_dim)
+class TinyTransformerBlock(layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim, **kwargs):
+        super().__init__(**kwargs)
+        self.attn = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = models.Sequential([
+            layers.Dense(ff_dim, activation="relu"),
+            layers.Dense(embed_dim)
         ])
-        self.layernorm1 = LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = LayerNormalization(epsilon=1e-6)
+        self.layernorm1 = layers.LayerNormalization()
+        self.layernorm2 = layers.LayerNormalization()
 
     def call(self, inputs):
-        attn_output = self.att(inputs, inputs)
+        attn_output = self.attn(inputs, inputs)
         out1 = self.layernorm1(inputs + attn_output)
         ffn_output = self.ffn(out1)
         return self.layernorm2(out1 + ffn_output)
 
-    def get_config(self):
-        config = super(TinyTransformerBlock, self).get_config()
-        config.update({
-            "embed_dim": self.att.key_dim,
-            "num_heads": self.att.num_heads,
-            "ff_dim": self.ffn[0].units
-        })
-        return config
+class CBAMBlock(layers.Layer):
+    def __init__(self, reduction_ratio=16, **kwargs):
+        super().__init__(**kwargs)
+        self.reduction_ratio = reduction_ratio
 
-# ------------------------------
-# Load Model with custom_objects
-# ------------------------------
-model = load_model(
-    "model.h5",
-    custom_objects={'CBAMBlock': CBAMBlock, 'TinyTransformerBlock': TinyTransformerBlock}
-)
+    def build(self, input_shape):
+        channel = input_shape[-1]
+        self.avg_pool = layers.GlobalAveragePooling2D()
+        self.max_pool = layers.GlobalMaxPooling2D()
+        self.shared_mlp = tf.keras.Sequential([
+            layers.Dense(channel // self.reduction_ratio, activation='relu'),
+            layers.Dense(channel)
+        ])
+        self.conv2d = layers.Conv2D(filters=1, kernel_size=7, padding='same', activation='sigmoid')
 
-class_labels = ['glioma', 'meningioma', 'no tumor', 'pituitary']
+    def call(self, inputs):
+        avg_pool = self.avg_pool(inputs)
+        max_pool = self.max_pool(inputs)
+        avg_out = self.shared_mlp(avg_pool)
+        max_out = self.shared_mlp(max_pool)
+        channel_attention = tf.nn.sigmoid(avg_out + max_out)
+        channel_attention = tf.expand_dims(tf.expand_dims(channel_attention, 1), 1)
+        x = inputs * channel_attention
+        avg_pool_spatial = tf.reduce_mean(x, axis=-1, keepdims=True)
+        max_pool_spatial = tf.reduce_max(x, axis=-1, keepdims=True)
+        concat = tf.concat([avg_pool_spatial, max_pool_spatial], axis=-1)
+        spatial_attention = self.conv2d(concat)
+        return x * spatial_attention
 
-# ------------------------------
-# Grad-CAM Function
-# ------------------------------
-def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None):
+# ---- Load model ----
+
+model = load_model("model/brain_tumor_model_with_gradcam.h5", custom_objects={
+    'CBAMBlock': CBAMBlock,
+    'TinyTransformerBlock': TinyTransformerBlock
+})
+
+last_conv_layer_name = "Conv_1"
+class_names = ["Glioma", "Meningioma", "No Tumor", "Pituitary"]
+
+# ---- Database Logging ----
+
+def insert_prediction(image_name, predicted_class, confidence):
+    try:
+        print(f"Inserting prediction for image: {image_name} - {predicted_class} with confidence: {confidence:.2f}")
+        conn = psycopg2.connect(
+            dbname="brain_tumor_log",
+            user="postgres",
+            password="123456",
+            host="localhost",
+            port="5432"
+        )
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO predictions (image_name, predicted_class, confidence_score, timestamp) VALUES (%s, %s, %s, %s)",
+            (image_name, predicted_class, confidence, datetime.now())
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("Prediction logged to database successfully.")
+    except Exception as e:
+        print("Database logging error:", e)
+
+# ---- Grad-CAM ----
+
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name):
     grad_model = tf.keras.models.Model(
-        [model.inputs], [model.get_layer(last_conv_layer_name).output, model.output]
+        [model.input], [model.get_layer(last_conv_layer_name).output, model.output]
     )
     with tf.GradientTape() as tape:
-        conv_outputs, predictions = grad_model(img_array)
-        if pred_index is None:
-            pred_index = tf.argmax(predictions[0])
-        class_channel = predictions[:, pred_index]
-
-    grads = tape.gradient(class_channel, conv_outputs)
+        conv_outputs, predictions = grad_model({"input_layer": img_array})
+        pred_index = tf.argmax(predictions[0])
+        loss = predictions[:, pred_index]
+    grads = tape.gradient(loss, conv_outputs)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
     conv_outputs = conv_outputs[0]
     heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
@@ -128,41 +109,53 @@ def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None
     heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
     return heatmap.numpy()
 
-# ------------------------------
-# Create Flask app
-# ------------------------------
-app = Flask(__name__)
+def overlay_gradcam(image, heatmap, alpha=0.3):
+    img = np.array(image.resize((224, 224)))
+    heatmap = np.uint8(255 * heatmap)
+    colormap = cm.get_cmap("jet")
+    jet_colors = colormap(np.arange(256))[:, :3]
+    jet_heatmap = jet_colors[heatmap]
+    jet_heatmap = tf.image.resize(jet_heatmap, (img.shape[0], img.shape[1])).numpy()
+    superimposed_img = jet_heatmap * alpha + img / 255.0
+    return Image.fromarray(np.uint8(superimposed_img * 255))
 
-# ------------------------------
-# Routes
-# ------------------------------
-@app.route('/')
-def home():
-    return "Brain Tumor Detection API is Running!"
+# ---- Predict ----
 
-@app.route('/predict', methods=['POST'])
-def predict():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file uploaded."})
+def predict(image):
+    image_resized = image.resize((224, 224))
+    img_array = np.expand_dims(np.array(image_resized) / 255.0, axis=0)
 
-    file = request.files['file']
+    # predict using input layer name if it exists
+    predictions = model.predict({"input_layer": img_array})[0]
+    pred_index = np.argmax(predictions)
+    pred_class = class_names[pred_index]
+    confidence = float(predictions[pred_index]) * 100
 
-    img = Image.open(file.stream).convert('RGB')
-    img_resized = img.resize((224, 224))
-    img_array = image.img_to_array(img_resized)
-    img_array = np.expand_dims(img_array, axis=0) / 255.0
+    # Grad-CAM heatmap
+    heatmap = make_gradcam_heatmap(img_array, model, last_conv_layer_name)
+    gradcam_img = overlay_gradcam(image_resized, heatmap)
 
-    prediction = model.predict(img_array)[0]
-    predicted_class = np.argmax(prediction)
-    label = class_labels[predicted_class]
+    # Get image name or use fallback
+    image_name = getattr(image, "filename", "Unknown Image")
 
-    result_text = f"Tumor predicted: {label}" if label != "no tumor" else "No tumor predicted"
-    
-    return jsonify({"prediction": result_text})
+    # Log to DB
+    insert_prediction(image_name, pred_class, round(confidence, 2))
 
-# ------------------------------
-# Heroku-Compatible Launch
-# ------------------------------
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    if pred_class == "No Tumor":
+        result_text = f"🧠 No tumor predicted\nConfidence: {confidence:.2f}%"
+    else:
+        result_text = f"⚠️ Tumor predicted: {pred_class}\nConfidence: {confidence:.2f}%"
+
+    return result_text, gradcam_img
+
+# ---- Gradio Interface ----
+
+interface = gr.Interface(
+    fn=predict,
+    inputs=gr.Image(type="pil"),
+    outputs=["text", "image"],
+    title="Brain Tumor Detection with Grad-CAM",
+    description="Upload a brain MRI to classify tumor type and view Grad-CAM. Logs predictions to PostgreSQL."
+)
+
+interface.launch()
