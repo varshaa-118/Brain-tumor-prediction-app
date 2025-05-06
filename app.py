@@ -4,7 +4,7 @@ import tensorflow as tf
 import psycopg2
 import os
 import gdown
-from datetime import datetime
+from datetime import datetime, timedelta
 from PIL import Image
 from tensorflow.keras.models import load_model
 from tensorflow.keras import layers, models
@@ -79,6 +79,31 @@ model = load_model(model_path, custom_objects={
 last_conv_layer_name = "Conv_1"
 class_names = ["Glioma", "Meningioma", "No Tumor", "Pituitary"]
 
+# ---- Auto Delete Function ----
+
+def delete_old_predictions(days=7):
+    try:
+        cutoff_date = datetime.now() - timedelta(days=days)
+        conn = psycopg2.connect(
+            dbname="brain_tumor_log",
+            user="postgres",
+            password="123456",
+            host="localhost",
+            port="5432"
+        )
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM predictions WHERE timestamp < %s",
+            (cutoff_date,)
+        )
+        deleted_count = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"✅ Deleted {deleted_count} old records older than {days} days.")
+    except Exception as e:
+        print("❌ Error deleting old records:", e)
+
 # ---- Database Logging ----
 
 def insert_prediction(image_name, predicted_class, confidence):
@@ -99,9 +124,10 @@ def insert_prediction(image_name, predicted_class, confidence):
         conn.commit()
         cur.close()
         conn.close()
-        print("Prediction logged to database successfully.")
+        print("✅ Prediction logged to database successfully.")
+        delete_old_predictions(days=7)  # <-- Auto-delete here
     except Exception as e:
-        print("Database logging error:", e)
+        print("❌ Database logging error:", e)
 
 # ---- Grad-CAM ----
 
@@ -162,7 +188,7 @@ interface = gr.Interface(
     inputs=gr.Image(type="pil"),
     outputs=["text", "image"],
     title="Brain Tumor Detection with Grad-CAM",
-    description="Upload a brain MRI to classify tumor type and view Grad-CAM. Logs predictions to PostgreSQL."
+    description="Upload a brain MRI to classify tumor type and view Grad-CAM. Logs predictions to PostgreSQL and auto-deletes old records."
 )
 
 interface.launch()
